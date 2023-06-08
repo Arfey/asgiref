@@ -147,6 +147,10 @@ class AsyncToSync(Generic[_P, _R]):
     # Local, not a threadlocal, so that tasks can work out what their parent used.
     executors = Local()
 
+    parent_task: "contextvars.ContextVar[asyncio.Task[object]]" = contextvars.ContextVar(
+        "parent_task"
+    )
+
     # When we can't find a CurrentThreadExecutor from the context, such as
     # inside create_task, we'll look it up here from the running event loop.
     loop_thread_executors: "Dict[asyncio.AbstractEventLoop, CurrentThreadExecutor]" = {}
@@ -340,7 +344,8 @@ class AsyncToSync(Generic[_P, _R]):
 
         current_task = SyncToAsync.get_current_task()
         assert current_task is not None
-        self.launch_map[current_task] = source_thread
+        if SyncToAsync.launch_map.get(source_thread) != current_task:
+            self.launch_map[current_task] = source_thread
         try:
             # If we have an exception, run the function inside the except block
             # after raising it so exc_info is correctly populated.
@@ -356,7 +361,10 @@ class AsyncToSync(Generic[_P, _R]):
         else:
             call_result.set_result(result)
         finally:
-            del self.launch_map[current_task]
+            try:
+                del self.launch_map[asyncio.current_task()]
+            except KeyError:
+                pass
 
             context[0] = contextvars.copy_context()
 
@@ -540,7 +548,11 @@ class SyncToAsync(Generic[_P, _R]):
             # Only delete the launch_map parent if we set it, otherwise it is
             # from someone else.
             if parent_set:
-                del self.launch_map[current_thread]
+                try:
+                    del self.launch_map[current_thread]
+                except KeyError:
+                    pass
+
 
     @staticmethod
     def get_current_task() -> Optional["asyncio.Task[Any]"]:
@@ -548,10 +560,16 @@ class SyncToAsync(Generic[_P, _R]):
         Implementation of asyncio.current_task()
         that returns None if there is no task.
         """
+        current_task = AsyncToSync.parent_task.get(None)
+
         try:
-            return asyncio.current_task()
+            if not current_task:
+                current_task = asyncio.current_task()
+                AsyncToSync.parent_task.set(current_task)
         except RuntimeError:
-            return None
+            pass
+
+        return current_task
 
 
 @overload
